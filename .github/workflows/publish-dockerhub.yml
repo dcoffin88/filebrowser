@@ -112,6 +112,13 @@ jobs:
           docker buildx imagetools inspect \
             "gtstef/filebrowser:${VERSION}"
 
+      - name: Install Skopeo
+        if: steps.check.outputs.build == 'true'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+      
       - name: Mirror upstream image to Docker Hub
         if: steps.check.outputs.build == 'true'
         env:
@@ -122,8 +129,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          SOURCE="docker.io/gtstef/filebrowser:${VERSION}"
+          DEST="docker.io/${IMAGE}:${VERSION}"
+
+          echo "Mirroring ${SOURCE} to ${DEST}"
+
+          skopeo copy --all \
+            "docker://${SOURCE}" \
+            "docker://${DEST}"
+
           tags=(
-            --tag "${IMAGE}:${VERSION}"
             --tag "${IMAGE}:${CHANNEL}"
           )
 
@@ -133,7 +148,7 @@ jobs:
 
           docker buildx imagetools create \
             "${tags[@]}" \
-            "gtstef/filebrowser:${VERSION}"
+            "${IMAGE}:${VERSION}"
 
           echo "Published ${VERSION} successfully."
 
