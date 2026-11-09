@@ -1,0 +1,160 @@
+
+name: Publish FileBrowser to Docker Hub
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Republish even if already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-filebrowser-dockerhub
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta]
+
+    steps:
+      - name: Check latest upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(
+            gh api \
+              'repos/gtsteffaniak/filebrowser/releases?per_page=100' \
+            | jq -r --arg channel "$CHANNEL" '
+                [
+                  .[]
+                  | select(.draft == false)
+                  | .tag_name
+                  | select(
+                      test(
+                        "^v[0-9]+\\.[0-9]+\\.[0-9]+-" + $channel + "$"
+                      )
+                    )
+                ][0] // empty
+              '
+          )"
+
+          if [[ -z "$tag" ]]; then
+            echo "No $CHANNEL release found." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          echo "Latest $CHANNEL release: $tag"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Determine whether publishing is needed
+        id: check
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/filebrowser
+          VERSION: ${{ steps.release.outputs.version }}
+          FORCE_BUILD: ${{ inputs.force_build || 'false' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$FORCE_BUILD" == true ]]; then
+            echo "Forced publish requested."
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if docker buildx imagetools inspect \
+            "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "Version ${VERSION} already published."
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          else
+            echo "Version ${VERSION} not published."
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify upstream Docker image
+        if: steps.check.outputs.build == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools inspect \
+            "gtstef/filebrowser:${VERSION}"
+
+      - name: Mirror upstream image to Docker Hub
+        if: steps.check.outputs.build == 'true'
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/filebrowser
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL: ${{ matrix.channel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tags=(
+            --tag "${IMAGE}:${VERSION}"
+            --tag "${IMAGE}:${CHANNEL}"
+          )
+
+          if [[ "$CHANNEL" == stable ]]; then
+            tags+=(--tag "${IMAGE}:latest")
+          fi
+
+          docker buildx imagetools create \
+            "${tags[@]}" \
+            "gtstef/filebrowser:${VERSION}"
+
+          echo "Published ${VERSION} successfully."
+
+      - name: Publish summary
+        if: steps.check.outputs.build == 'true'
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/filebrowser
+          VERSION: ${{ steps.release.outputs.version }}
+          CHANNEL: ${{ matrix.channel }}
+        shell: bash
+        run: |
+          {
+            echo "## FileBrowser $CHANNEL Release"
+            echo ""
+            echo "Source: gtstef/filebrowser:${VERSION}"
+            echo ""
+            echo "Published:"
+            echo "- ${IMAGE}:${VERSION}"
+            echo "- ${IMAGE}:${CHANNEL}"
+
+            if [[ "$CHANNEL" == stable ]]; then
+              echo "- ${IMAGE}:latest"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
